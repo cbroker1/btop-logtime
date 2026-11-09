@@ -1,0 +1,296 @@
+--- a/src/btop.cpp
++++ b/src/btop.cpp
+@@ -189,6 +189,73 @@
+ 	}
+ }
+ 
++#ifdef GPU_SUPPORT
++//* Keeps every detected GPU visible as cards change between boots: one box each when all of them fit the
++//* terminal (gpu0-gpu5), otherwise no gpu boxes, which makes the cpu box list every GPU (show_gpu_info "Auto")
++namespace GpuAuto {
++	bool active = false;	// set at startup when gpu_auto_boxes is on and the layout lists a gpu box
++	size_t slot = 0;		// how many non-gpu boxes came before the first gpu box
++	size_t placed = 0;		// gpu boxes set by the last fit
++	bool fitted = false;
++
++	//? shown_boxes split into its non-gpu boxes and how many gpu boxes it lists
++	auto split_boxes() {
++		vector<string> others;
++		size_t gpus_listed = 0;
++		for (const auto& box : ssplit(Config::getS("shown_boxes"))) {
++			if (box.starts_with("gpu")) ++gpus_listed;
++			else others.push_back(box);
++		}
++		return std::pair{others, gpus_listed};
++	}
++
++	string join(const vector<string>& others, size_t gpu_boxes) {
++		vector<string> list = others;
++		const auto at = list.begin() + std::min(slot, list.size());
++		vector<string> gpus;
++		for (size_t i = 0; i < gpu_boxes; i++) gpus.push_back("gpu" + to_string(i));
++		list.insert(at, gpus.begin(), gpus.end());
++		if (list.empty()) list = {"cpu", "mem", "net"};
++		string joined;
++		for (const auto& box : list) joined += (joined.empty() ? "" : " ") + box;
++		return joined;
++	}
++
++	//? Before the config is written: store the full layout instead of whatever fitted the last window size,
++	//? with at least gpu0 so auto mode still starts after a boot with no cards (gpu boxes are only checked against
++	//? detected GPUs after GpuAuto has rebuilt them)
++	void save_intent() {
++		if (not active) return;
++		const auto [others, gpus_listed] = split_boxes();
++		if (fitted and gpus_listed != placed) return;
++		Config::set("shown_boxes", join(others, std::clamp<size_t>(Gpu::gpu_names.size(), 1, 6)));
++	}
++
++	void fit() {
++		if (not active) return;
++		const auto [others, gpus_listed] = split_boxes();
++		//? A different gpu count than we placed means the user toggled boxes or picked a preset; stop overriding
++		if (fitted and gpus_listed != placed) { active = false; return; }
++
++		const size_t total = Gpu::gpu_names.size();
++		const auto join = [&](size_t gpu_boxes) { return GpuAuto::join(others, gpu_boxes); };
++
++		size_t gpu_boxes = 0;
++		if (total > 0 and total <= 6) {
++			const auto [w, h] = Term::get_min_size(join(total));
++			if (Term::width >= w and Term::height >= h) gpu_boxes = total;
++		}
++		const string result = join(gpu_boxes);
++		placed = gpu_boxes;
++		fitted = true;
++		if (result != Config::getS("shown_boxes")) {
++			Config::set("shown_boxes", result);
++			Config::check_boxes(result);
++		}
++	}
++}
++#endif
++
+ //* Handler for SIGWINCH and general resizing events, does nothing if terminal hasn't been resized unless force=true
+ void term_resize(bool force) {
+ 	static atomic<bool> resizing (false);
+@@ -211,6 +278,9 @@
+ 	if (Runner::active) Runner::stop();
+ 	Term::refresh();
+ 	Config::unlock();
++#ifdef GPU_SUPPORT
++	GpuAuto::fit();
++#endif
+ 
+ 	auto boxes = Config::getS("shown_boxes");
+ 	auto min_size = Term::get_min_size(boxes);
+@@ -291,6 +361,7 @@
+ #ifdef GPU_SUPPORT
+ 	Gpu::Nvml::shutdown();
+ 	Gpu::Rsmi::shutdown();
++	GpuAuto::save_intent();
+ #endif
+ 
+ 	Config::write();
+@@ -1019,6 +1090,20 @@
+ 		clean_quit(1);
+ 	}
+ 
++#ifdef GPU_SUPPORT
++	//? The saved layout may name GPUs that are gone after cards were swapped, which would make check_boxes
++	//? reject it, so the gpu entries are rebuilt from the GPUs detected this run.
++	if (Config::getB("gpu_auto_boxes")) {
++		const auto boxes = ssplit(Config::getS("shown_boxes"));
++		const auto first_gpu = std::ranges::find_if(boxes, [](const string& b) { return b.starts_with("gpu"); });
++		if (first_gpu != boxes.end()) {
++			GpuAuto::slot = std::ranges::count_if(boxes.begin(), first_gpu, [](const string& b) { return not b.starts_with("gpu"); });
++			GpuAuto::active = true;
++			GpuAuto::fit();
++		}
++	}
++#endif
++
+ 	if (not Config::check_boxes(Config::getS("shown_boxes"))) {
+ 		Config::check_boxes("cpu mem net proc");
+ 		Config::set("shown_boxes", "cpu mem net proc"s);
+--- a/src/btop_config.cpp
++++ b/src/btop_config.cpp
+@@ -96,6 +96,10 @@
+ 		{"graph_time_axis", 	"#* Draw a time ruler on the bottom border under the cpu, gpu, net and disk io graphs: labeled ticks (now, 1m, 2m, 4m ... 1h) with\n"
+ 								"#* unlabeled ticks in between that get denser towards the oldest history."},
+ 
++		{"gpu_auto_boxes", 		"#* If shown_boxes lists any gpu box at startup, manage the gpu boxes from the GPUs detected this run: one box per GPU when\n"
++								"#* all of them fit the terminal (at most 6), otherwise none, so the cpu box lists every GPU. Re-fitted on resize until gpu\n"
++								"#* boxes are toggled by hand or a preset is picked. Keeps the layout valid when cards are swapped between boots."},
++
+ 		{"graph_fade", 			"#* Fade older graph history: columns blend towards the background the further left (older) they are. Needs graph_log_time and a\n"
+ 								"#* graph at least 12 columns wide."},
+ 
+@@ -312,6 +316,7 @@
+ 		{"io_graph_combined", false},
+ 		{"graph_log_time", true},
+ 		{"graph_time_axis", true},
++		{"gpu_auto_boxes", true},
+ 		{"graph_fade", false},
+ 		{"net_auto", true},
+ 		{"net_sync", true},
+--- a/src/btop_draw.cpp
++++ b/src/btop_draw.cpp
+@@ -1115,7 +1115,7 @@
+ 						out += rjust(to_string(temp), 3 + (b_width >= 34 or temp > 99)) + Theme::c("main_fg") + unit;
+ 					}
+ 				}
+-				if (cy < b_height - 1) break;
++				if (cy >= b_height - 2) break; // out of rows (upstream had this inverted, so it stopped after the first GPU)
+ 			}
+ 		}
+ 	#endif
+--- a/src/linux/btop_collect.cpp
++++ b/src/linux/btop_collect.cpp
+@@ -174,9 +174,15 @@
+ 					rsmi_clk_type_t,
+ 					rsmi_memory_type_t;
+ 
+-		struct rsmi_frequencies_t {uint32_t num_supported, current, frequency[RSMI_MAX_NUM_FREQUENCIES];};
++		//? ROCm SMI < 6 layout
++		struct rsmi_frequencies_t {uint32_t num_supported, current; uint64_t frequency[RSMI_MAX_NUM_FREQUENCIES];};
++		//? ROCm SMI >= 6 added has_deep_sleep and one more frequency slot
++		#define RSMI_MAX_NUM_FREQUENCIES_V6 33
++		struct rsmi_frequencies_v6_t {bool has_deep_sleep; uint32_t num_supported, current; uint64_t frequency[RSMI_MAX_NUM_FREQUENCIES_V6];};
++		struct rsmi_version_t {uint32_t major, minor, patch; const char* build;};
+ 
+ 		//? Function pointers
++		rsmi_status_t (*rsmi_version_get)(rsmi_version_t*);
+ 		rsmi_status_t (*rsmi_init)(uint64_t);
+ 		rsmi_status_t (*rsmi_shut_down)();
+ 		rsmi_status_t (*rsmi_num_monitor_devices)(uint32_t*);
+@@ -185,7 +191,7 @@
+ 		rsmi_status_t (*rsmi_dev_temp_metric_get)(uint32_t, uint32_t, rsmi_temperature_metric_t, int64_t*);
+ 		rsmi_status_t (*rsmi_dev_busy_percent_get)(uint32_t, uint32_t*);
+ 		rsmi_status_t (*rsmi_dev_memory_busy_percent_get)(uint32_t, uint32_t*);
+-		rsmi_status_t (*rsmi_dev_gpu_clk_freq_get)(uint32_t, rsmi_clk_type_t, rsmi_frequencies_t*);
++		rsmi_status_t (*rsmi_dev_gpu_clk_freq_get)(uint32_t, rsmi_clk_type_t, void*); // struct layout depends on rsmi_major
+ 		rsmi_status_t (*rsmi_dev_power_ave_get)(uint32_t, uint32_t, uint64_t*);
+ 		rsmi_status_t (*rsmi_dev_memory_total_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
+ 		rsmi_status_t (*rsmi_dev_memory_usage_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
+@@ -193,6 +199,7 @@
+ 
+ 		//? Data
+ 		void* rsmi_dl_handle;
++		uint32_t rsmi_major = 5;
+ 	#endif
+ 		bool initialized = false;
+ 		bool init();
+@@ -1230,6 +1237,8 @@
+ 			const array libRocAlts = {
+ 				"/opt/rocm/lib/librocm_smi64.so",
+ 				"librocm_smi64.so",
++				"librocm_smi64.so.7", // ubuntu 26.04
++				"librocm_smi64.so.6",
+ 				"librocm_smi64.so.5", // fedora
+ 				"librocm_smi64.so.1.0", // debian
+ 			};
+@@ -1272,6 +1281,9 @@
+ 		    LOAD_SYM(rsmi_dev_pci_throughput_get);
+ 
+             #undef LOAD_SYM
++
++			//? Optional: without it, assume the pre-6 struct layout
++			rsmi_version_get = (decltype(rsmi_version_get))dlsym(rsmi_dl_handle, "rsmi_version_get");
+         #endif
+ 
+ 			//? Function calls
+@@ -1281,6 +1293,14 @@
+ 				return false;
+ 			}
+ 
++		#if !defined(RSMI_STATIC)
++			if (rsmi_version_get != nullptr) {
++				rsmi_version_t version{};
++				if (rsmi_version_get(&version) == RSMI_STATUS_SUCCESS) rsmi_major = version.major;
++			}
++			Logger::debug("ROCm SMI major version " + to_string(rsmi_major));
++		#endif
++
+ 			//? Device count
+ 			result = rsmi_num_monitor_devices(&device_count);
+ 			if (result != RSMI_STATUS_SUCCESS) {
+@@ -1289,8 +1309,9 @@
+ 			}
+ 
+ 			if (device_count > 0) {
+-				gpus.resize(gpus.size() + device_count);
+-				gpu_names.resize(gpus.size() + device_count);
++				//? Both lists already hold the NVIDIA GPUs; size gpu_names from that same count (upstream used the already grown gpus.size())
++				gpus.resize(Nvml::device_count + device_count);
++				gpu_names.resize(Nvml::device_count + device_count);
+ 
+ 				initialized = true;
+ 
+@@ -1313,6 +1334,27 @@
+ 			return true;
+ 		}
+ 
++		//? Current clock in MHz, read through the struct layout the loaded library expects
++		template <typename Freqs>
++		rsmi_status_t clock_mhz(uint32_t dev, rsmi_clk_type_t type, long long& mhz) {
++			Freqs freqs{};
++			rsmi_status_t result = rsmi_dev_gpu_clk_freq_get(dev, type, &freqs);
++			if (result != RSMI_STATUS_SUCCESS) return result;
++			constexpr uint32_t slots = sizeof(freqs.frequency) / sizeof(freqs.frequency[0]);
++			if (freqs.current >= slots) return 1; // RSMI_STATUS_INVALID_ARGS
++			mhz = (long long)freqs.frequency[freqs.current]/1000000; // Hz to MHz
++			return RSMI_STATUS_SUCCESS;
++		}
++
++		rsmi_status_t clock_mhz(uint32_t dev, rsmi_clk_type_t type, long long& mhz) {
++		#if defined(RSMI_STATIC)
++			return clock_mhz<rsmi_frequencies_t>(dev, type, mhz);
++		#else
++			return rsmi_major >= 6 ? clock_mhz<rsmi_frequencies_v6_t>(dev, type, mhz)
++			                       : clock_mhz<rsmi_frequencies_t>(dev, type, mhz);
++		#endif
++		}
++
+ 		template <bool is_init>
+ 		bool collect(gpu_info* gpus_slice) { // raw pointer to vector data, size == device_count, offset by Nvml::device_count elements
+ 			if (!initialized) return false;
+@@ -1367,21 +1409,20 @@
+ 
+ 				//? Clock speeds
+ 				if (gpus_slice[i].supported_functions.gpu_clock) {
+-					rsmi_frequencies_t frequencies;
+-					result = rsmi_dev_gpu_clk_freq_get(i, RSMI_CLK_TYPE_SYS, &frequencies);
++					long long mhz;
++					result = clock_mhz(i, RSMI_CLK_TYPE_SYS, mhz);
+     				if (result != RSMI_STATUS_SUCCESS) {
+ 						Logger::warning("ROCm SMI: Failed to get GPU clock speed: ");
+ 						if constexpr(is_init) gpus_slice[i].supported_functions.gpu_clock = false;
+-    				} else gpus_slice[i].gpu_clock_speed = (long long)frequencies.frequency[frequencies.current]/1000000; // Hz to MHz
++    				} else gpus_slice[i].gpu_clock_speed = mhz;
+ 				}
+ 
+ 				if (gpus_slice[i].supported_functions.mem_clock) {
+-					rsmi_frequencies_t frequencies;
+-					result = rsmi_dev_gpu_clk_freq_get(i, RSMI_CLK_TYPE_MEM, &frequencies);
++					result = clock_mhz(i, RSMI_CLK_TYPE_MEM, gpus_slice[i].mem_clock_speed);
+     				if (result != RSMI_STATUS_SUCCESS) {
+ 						Logger::warning("ROCm SMI: Failed to get VRAM clock speed: ");
+ 						if constexpr(is_init) gpus_slice[i].supported_functions.mem_clock = false;
+-    				} else gpus_slice[i].mem_clock_speed = (long long)frequencies.frequency[frequencies.current]/1000000; // Hz to MHz
++    				}
+ 				}
+ 
+     			//? Power usage & state
+@@ -1391,7 +1432,10 @@
+     				if (result != RSMI_STATUS_SUCCESS) {
+ 						Logger::warning("ROCm SMI: Failed to get GPU power usage");
+ 						if constexpr(is_init) gpus_slice[i].supported_functions.pwr_usage = false;
+-    				} else gpus_slice[i].gpu_percent.at("gpu-pwr-totals").push_back(clamp((long long)round((double)gpus_slice[i].pwr_usage * 100.0 / (double)gpus_slice[i].pwr_max_usage), 0ll, 100ll));
++    				} else {
++						gpus_slice[i].pwr_usage = (long long)(power/1000); // microWatts to milliWatts, like pwr_max_usage (upstream never stored it)
++						gpus_slice[i].gpu_percent.at("gpu-pwr-totals").push_back(clamp((long long)round((double)gpus_slice[i].pwr_usage * 100.0 / (double)gpus_slice[i].pwr_max_usage), 0ll, 100ll));
++					}
+ 
+ 					if constexpr(is_init) gpus_slice[i].supported_functions.pwr_state = false;
+ 				}

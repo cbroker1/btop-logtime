@@ -1,0 +1,4 @@
+LIBRARY CPPdll.dll
+EXPORTS
+    ?FetchLHMReport@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ
+    ?FetchLHMValues@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ

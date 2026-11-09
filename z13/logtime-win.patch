@@ -1,0 +1,543 @@
+diff --git a/src/btop_collect.cpp b/src/btop_collect.cpp
+index 36249a6..4e0d911 100644
+--- a/src/btop_collect.cpp
++++ b/src/btop_collect.cpp
+@@ -333,12 +333,25 @@ namespace Cpu {
+ 			gpu_order.clear();
+ 
+ 			//? Iterate over Libre Hardware Monitor output
+-			for (const auto& line : outvec) {
++			for (auto line : outvec) {
++				//? The dump uses CRLF line endings: drop the trailing CR so it doesn't end up in values like the clock string
++				if (not line.empty() and line.back() == '\r') line.pop_back();
+ 
+ 				//? Split line by tab separator
+ 				auto linevec = ssplit(line, '\t');
+ 				if (linevec.size() < 3) continue;
+-				
++
++				//? Sensor lines carry a number in the third field. Sensors the hardware library can't read report "NaN" (all per-core
++				//? clocks on a Ryzen AI Max+ 395 with the WinRing0 driver blocked), skip those instead of failing the whole parse.
++				if (linevec.front() != "Hardware") {
++					const string& value = linevec.at(2);
++					char* end = nullptr;
++					const double num = std::strtod(value.c_str(), &end);
++					if (value.empty() or end == value.c_str() or not std::isfinite(num)) continue;
++					//? A temperature of exactly 0 is an unread sensor (e.g. Core (Tctl/Tdie) without the driver), not a reading
++					if (linevec.at(1) == "Temperature" and num <= 0) continue;
++				}
++
+ 				try {
+ 					//? New sensor section
+ 					if (linevec.front() == "Hardware") {
+@@ -371,6 +384,10 @@ namespace Cpu {
+ 								gpus[gpu_name].cpu_gpu = false;
+ 							}
+ 						}
++						//? Gpu temp fallback for APUs without a core sensor (Radeon 8060S reports only "GPU VR SoC"); a core reading replaces it
++						else if (linevec.front().starts_with("GPU VR SoC") and linevec.at(1) == "Temperature") {
++							if (gpus[gpu_name].temp == 0) gpus[gpu_name].temp = std::stoi(linevec.at(2));
++						}
+ 						else if (not hasGPUload and linevec.front().starts_with("D3D 3D") and linevec.at(1) == "Load") {
+ 							gpus[gpu_name].usage = std::stoi(linevec.at(2));							
+ 						}
+@@ -384,8 +401,10 @@ namespace Cpu {
+ 							gpus[gpu_name].mem_used = std::stoll(linevec.at(2)) << 20ll;							
+ 							gpus[gpu_name].cpu_gpu = true;
+ 						}
+-						//? Gpu mem total
+-						else if (linevec.front().starts_with("GPU Memory Total") or linevec.front().starts_with("D3D Dedicated Memory Total")) {
++						//? Gpu mem total, read every cycle so a changed VRAM split (BIOS/Armoury Crate "dedicated" memory) shows after reboot.
++						//? The driver's own figure (ADL "GPU Memory Total", exactly the configured carve-out) wins over D3D's slightly smaller one.
++						else if (linevec.front().starts_with("GPU Memory Total")
++								or (linevec.front().starts_with("D3D Dedicated Memory Total") and gpus[gpu_name].mem_total == 0)) {
+ 							gpus[gpu_name].mem_total = std::stoll(linevec.at(2)) << 20ll;
+ 						}
+ 					}
+@@ -1215,12 +1234,12 @@ namespace Cpu {
+ 
+ 			if (got_sensors) {
+ 				current_cpu.temp.at(0).push_back(OHMRrawStats.CPU.at(0));
+-				if (current_cpu.temp.at(0).size() > 20) current_cpu.temp.at(0).pop_front();
++				if (current_cpu.temp.at(0).size() > Config::hist_cap(20)) current_cpu.temp.at(0).pop_front();
+ 
+ 				for (const auto& [core, temp] : core_mapping) {
+ 					if (cmp_less(core + 1, current_cpu.temp.size()) and cmp_less(temp, OHMRrawStats.CPU.size() - 1)) {
+ 						current_cpu.temp.at(core + 1).push_back(OHMRrawStats.CPU.at(temp + 1));
+-						if (current_cpu.temp.at(core + 1).size() > 20) current_cpu.temp.at(core + 1).pop_front();
++						if (current_cpu.temp.at(core + 1).size() > Config::hist_cap(20)) current_cpu.temp.at(core + 1).pop_front();
+ 					}
+ 				}
+ 			}
+@@ -1251,9 +1270,9 @@ namespace Cpu {
+ 				const auto& gpu = OHMRrawStats.GPUS.contains(current_gpu) ? OHMRrawStats.GPUS.at(current_gpu) : OHMRrawStats.GPUS.at(Config::available_gpus.at(1));
+ 				gpu_clock = gpu.clock_mhz;
+ 				cpu.gpu_temp.push_back(gpu.temp);
+-				if (cpu.gpu_temp.size() > 40) cpu.gpu_temp.pop_front();
++				if (cpu.gpu_temp.size() > Config::hist_cap(40)) cpu.gpu_temp.pop_front();
+ 				cpu.cpu_percent.at("gpu").push_back(gpu.usage);
+-				while (cmp_greater(cpu.cpu_percent.at("gpu").size(), width * 2)) cpu.cpu_percent.at("gpu").pop_front();
++				while (cmp_greater(cpu.cpu_percent.at("gpu").size(), Config::hist_cap(width * 2))) cpu.cpu_percent.at("gpu").pop_front();
+ 			}
+ 		}
+ 		else {
+@@ -1299,7 +1318,7 @@ namespace Cpu {
+ 			cpu_total += cpu.core_percent.at(i).back();
+ 
+ 			//? Reduce size if there are more values than needed for graph
+-			if (cpu.core_percent.at(i).size() > 40) cpu.core_percent.at(i).pop_front();
++			if (cpu.core_percent.at(i).size() > Config::hist_cap(40)) cpu.core_percent.at(i).pop_front();
+ 
+ 		}
+ 
+@@ -1319,7 +1338,7 @@ namespace Cpu {
+ 		cpu.cpu_percent.at("total").push_back(clamp(cpu_total / Shared::coreCount, 0ll, 100ll));
+ 
+ 		//? Reduce size if there are more values than needed for graph
+-		while (cmp_greater(cpu.cpu_percent.at("total").size(), width * 2)) cpu.cpu_percent.at("total").pop_front();
++		while (cmp_greater(cpu.cpu_percent.at("total").size(), Config::hist_cap(width * 2))) cpu.cpu_percent.at("total").pop_front();
+ 
+ 		//? Populate cpu.cpu_percent with all fields from stat
+ 		for (int ii = 0; const auto& val : times) {
+@@ -1327,7 +1346,7 @@ namespace Cpu {
+ 			cpu_old.at(time_names.at(ii)) = val;
+ 
+ 			//? Reduce size if there are more values than needed for graph
+-			while (cmp_greater(cpu.cpu_percent.at(time_names.at(ii)).size(), width * 2)) cpu.cpu_percent.at(time_names.at(ii)).pop_front();
++			while (cmp_greater(cpu.cpu_percent.at(time_names.at(ii)).size(), Config::hist_cap(width * 2))) cpu.cpu_percent.at(time_names.at(ii)).pop_front();
+ 			ii++;
+ 		}
+ 
+@@ -1394,7 +1413,7 @@ namespace Mem {
+ 			cpu_gpu = gpu.cpu_gpu;
+ 			for (const auto name : { "gpu_used", "gpu_free" }) {
+ 				mem.percent.at(name).push_back(round((double)mem.stats.at(name) * 100 / mem.stats.at("gpu_total")));
+-				while (cmp_greater(mem.percent.at(name).size(), width * 2)) mem.percent.at(name).pop_front();
++				while (cmp_greater(mem.percent.at(name).size(), Config::hist_cap(width * 2))) mem.percent.at(name).pop_front();
+ 			}
+ 		}
+ 
+@@ -1427,14 +1446,14 @@ namespace Mem {
+ 		//? Calculate percentages
+ 		for (const string name : { "used", "available", "cached", "commit"}) {
+ 			mem.percent.at(name).push_back(round((double)mem.stats.at(name) * 100 / (name == "commit" ? totalCommit : totalMem)));
+-			while (cmp_greater(mem.percent.at(name).size(), width * 2)) mem.percent.at(name).pop_front();
++			while (cmp_greater(mem.percent.at(name).size(), Config::hist_cap(width * 2))) mem.percent.at(name).pop_front();
+ 		}
+ 		
+ 
+ 		if (show_swap and mem.stats.at("page_total") > 0) {
+ 			for (const auto name : {"page_used", "page_free"}) {
+ 				mem.percent.at(name).push_back(round((double)mem.stats.at(name) * 100 / mem.stats.at("page_total")));
+-				while (cmp_greater(mem.percent.at(name).size(), width * 2)) mem.percent.at(name).pop_front();
++				while (cmp_greater(mem.percent.at(name).size(), Config::hist_cap(width * 2))) mem.percent.at(name).pop_front();
+ 			}
+ 			has_swap = true;
+ 		}
+@@ -1529,7 +1548,7 @@ namespace Mem {
+ 								else
+ 									disk.io_read.push_back(max((int64_t)0, (diskperf.BytesRead.QuadPart - disk.old_io.at(0))));
+ 								disk.old_io.at(0) = diskperf.BytesRead.QuadPart;
+-								while (cmp_greater(disk.io_read.size(), width * 2)) disk.io_read.pop_front();
++								while (cmp_greater(disk.io_read.size(), Config::hist_cap(width * 2))) disk.io_read.pop_front();
+ 
+ 								//? Write
+ 								if (disk.io_write.empty())
+@@ -1537,7 +1556,7 @@ namespace Mem {
+ 								else
+ 									disk.io_write.push_back(max((int64_t)0, (diskperf.BytesWritten.QuadPart - disk.old_io.at(1))));
+ 								disk.old_io.at(1) = diskperf.BytesWritten.QuadPart;
+-								while (cmp_greater(disk.io_write.size(), width * 2)) disk.io_write.pop_front();
++								while (cmp_greater(disk.io_write.size(), Config::hist_cap(width * 2))) disk.io_write.pop_front();
+ 
+ 								//? IO%
+ 								int64_t io_time = diskperf.ReadTime.QuadPart + diskperf.WriteTime.QuadPart;
+@@ -1546,7 +1565,7 @@ namespace Mem {
+ 								else
+ 									disk.io_activity.push_back(clamp((long)round((double)(io_time - disk.old_io.at(2)) / 1000 / (systime - old_systime)), 0l, 100l));
+ 								disk.old_io.at(2) = io_time;
+-								while (cmp_greater(disk.io_activity.size(), width * 2)) disk.io_activity.pop_front();
++								while (cmp_greater(disk.io_activity.size(), Config::hist_cap(width * 2))) disk.io_activity.pop_front();
+ 							}
+ 							
+ 							//! DeviceIoControl fail
+@@ -1682,7 +1701,7 @@ namespace Net {
+ 
+ 					//? Add values to graph
+ 					bandwidth.push_back(saved_stat.speed);
+-					while (cmp_greater(bandwidth.size(), width * 2)) bandwidth.pop_front();
++					while (cmp_greater(bandwidth.size(), Config::hist_cap(width * 2))) bandwidth.pop_front();
+ 
+ 					//? Set counters for auto scaling
+ 					if (net_auto and selected_iface == iface) {
+@@ -1996,7 +2015,7 @@ namespace Proc {
+ 			//? Update cpu percent deque for process cpu graph
+ 			if (not Config::getB("proc_per_core")) detailed.entry.cpu_p *= Shared::coreCount;
+ 			detailed.cpu_percent.push_back(clamp((long long)round(detailed.entry.cpu_p), 0ll, 100ll));
+-			while (cmp_greater(detailed.cpu_percent.size(), width)) detailed.cpu_percent.pop_front();
++			while (cmp_greater(detailed.cpu_percent.size(), Config::hist_cap(width))) detailed.cpu_percent.pop_front();
+ 
+ 			//? Process runtime
+ 			if (detailed.entry.cpu_s > 0) {
+@@ -2016,7 +2035,7 @@ namespace Proc {
+ 				redraw = true;
+ 			}
+ 
+-			while (cmp_greater(detailed.mem_bytes.size(), width)) detailed.mem_bytes.pop_front();
++			while (cmp_greater(detailed.mem_bytes.size(), Config::hist_cap(width))) detailed.mem_bytes.pop_front();
+ 
+ 			//? Get bytes read and written
+ 			if (WMIList.contains(pid)) {
+diff --git a/src/btop_config.cpp b/src/btop_config.cpp
+index a1b6671..b260909 100644
+--- a/src/btop_config.cpp
++++ b/src/btop_config.cpp
+@@ -88,6 +88,14 @@ namespace Config {
+ 
+ 		{"update_ms", 			"#* Update time in milliseconds, recommended 2000 ms or above for better sample times for graphs."},
+ 
++		{"graph_log_time", 		"#* Show graph history on a non-linear time axis: the newest samples keep full resolution (right edge), older samples are\n"
++								"#* averaged into progressively fewer columns, out to graph_history_seconds at the left edge."},
++
++		{"graph_history_seconds", "#* Age in seconds shown at the left edge of graphs when graph_log_time is on (3600 = 1 hour, range 10-86400)."},
++
++		{"graph_time_axis", 	"#* Draw a time ruler on the bottom border under the cpu, net and disk io graphs: labeled ticks (now, 1m, 2m, 4m ... 1h) with\n"
++								"#* unlabeled ticks in between that get denser towards the oldest history."},
++
+ 		{"proc_sorting",		"#* Processes sorting, \"pid\" \"program\" \"arguments\" \"threads\" \"user\" \"memory\" \"cpu lazy\" \"cpu direct\",\n"
+ 								"#* \"cpu lazy\" sorts top process over time (easier to follow), \"cpu direct\" updates top process directly."},
+ 		
+@@ -243,6 +251,8 @@ namespace Config {
+ 		{"io_mode", false},
+ 		{"base_10_sizes", false},
+ 		{"io_graph_combined", false},
++		{"graph_log_time", true},
++		{"graph_time_axis", true},
+ 		{"net_auto", true},
+ 		{"net_sync", false},
+ 		{"show_battery", true},
+@@ -258,6 +268,7 @@ namespace Config {
+ 
+ 	unordered_flat_map<string, int> ints = {
+ 		{"update_ms", 1500},
++		{"graph_history_seconds", 3600},
+ 		{"net_download", 100},
+ 		{"net_upload", 100},
+ 		{"detailed_pid", 0},
+@@ -381,6 +392,9 @@ namespace Config {
+ 		else if (name == "update_ms" and i_value > 86400000)
+ 			validError = "Config value update_ms set too high (>86400000).";
+ 
++		else if (name == "graph_history_seconds" and (i_value < 10 or i_value > 86400))
++			validError = "Config value graph_history_seconds must be between 10 and 86400.";
++
+ 		else
+ 			return true;
+ 
+diff --git a/src/btop_config.hpp b/src/btop_config.hpp
+index dd5ccbe..e5eac54 100644
+--- a/src/btop_config.hpp
++++ b/src/btop_config.hpp
+@@ -18,6 +18,7 @@ tab-size = 4
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <string>
+ #include <vector>
+ #include <robin_hood.h>
+@@ -71,6 +72,15 @@ namespace Config {
+ 	//* Return string for config key <name>
+ 	inline const string& getS(const string& name) { return strings.at(name); }
+ 
++	//* Number of history samples the graphs span on the non-linear time axis, 0 if graph_log_time is off
++	inline size_t hist_samples() {
++		if (not bools.at("graph_log_time")) return 0;
++		return std::max<size_t>(2, (size_t)ints.at("graph_history_seconds") * 1000 / std::max(100, ints.at("update_ms")));
++	}
++
++	//* History length a collector should keep for a deque it would otherwise trim to <base> samples
++	inline size_t hist_cap(size_t base) { return std::max(base, hist_samples()); }
++
+ 	string getAsString(const string& name);
+ 
+ 	extern string validError;
+diff --git a/src/btop_draw.cpp b/src/btop_draw.cpp
+index a0340e5..20df22d 100644
+--- a/src/btop_draw.cpp
++++ b/src/btop_draw.cpp
+@@ -21,6 +21,7 @@ tab-size = 4
+ #include <array>
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
+ #include <ranges>
+ 
+ #include <btop_draw.hpp>
+@@ -431,6 +432,58 @@ namespace Draw {
+ 
+ 		if (max_value == 0 and offset > 0) max_value = 100;
+ 		this->max_value = max_value;
++
++		log_mode = width >= 1 and Config::getB("graph_log_time");
++		if (log_mode) {
++			hist = data;
++			while (hist.size() > Config::hist_cap(width * 2 + 1)) hist.pop_front();
++			this->_rebuild();
++		}
++		else this->_init(data);
++	}
++
++	namespace {
++		//* Maps between graph columns and history age for the non-linear time axis (see Graph::_rebuild)
++		struct TimeAxis {
++			int slots;        //? Visible time slots, slot 0 is the newest (right edge)
++			double H;         //? Age in samples at the left edge
++			double k = 0;     //? Steepness of the curve, 0 = linear with 1 sample per slot
++
++			//? Exponential, with the steepness solved so that the newest slot spans about 1 sample and every older slot spans
++			//? more, until slot <slots> starts exactly H samples back. Falls back to 1 sample per slot when there are fewer
++			//? samples than slots and nothing to compress (or when the non-linear axis is off, H is then 2).
++			explicit TimeAxis(int slots) : slots(slots), H((double)std::max<size_t>(Config::hist_samples(), 2)) {
++				if (H / slots > 1.0) {
++					double lo = 0, hi = 60;
++					for (int it = 0; it < 60; it++) {
++						const double mid = (lo + hi) / 2;
++						const double first = H * std::expm1(mid / slots) / std::expm1(mid);
++						(first > 1.0 ? lo : hi) = mid;
++					}
++					k = (lo + hi) / 2;
++				}
++			}
++
++			//? Age in samples at which slot <q> starts
++			double age_at(int q) const {
++				return (k > 0) ? H * std::expm1(k * q / slots) / std::expm1(k) : (double)q;
++			}
++
++			//? Slot position (counted from the right edge) of an age in samples, the inverse of age_at()
++			double slot_at(double age) const {
++				return (k > 0) ? slots * std::log1p(age * std::expm1(k) / H) / k : age;
++			}
++
++			//? Age in samples at the left edge of the graph
++			double span() const { return (k > 0) ? H : (double)slots; }
++		};
++	}
++
++	void Graph::_init(const deque<long long>& data) {
++		graphs[true].clear();
++		graphs[false].clear();
++		current = true;
++		last = 0;
+ 		const int value_width = (tty_mode ? data.size() : ceil((double)data.size() / 2));
+ 		int data_offset = (value_width > width) ? data.size() - width * (tty_mode ? 1 : 2) : 0;
+ 
+@@ -447,9 +500,43 @@ namespace Draw {
+ 		this->_create(data, data_offset);
+ 	}
+ 
++	void Graph::_rebuild() {
++		const size_t n = hist.size();
++		const TimeAxis axis(width * (tty_mode ? 1 : 2));
++		const int slots = axis.slots;
++
++		//? Prefix sums over the history by age (age 0 = newest sample) so any span can be averaged in O(1)
++		thread_local std::vector<double> P;
++		P.assign(n + 1, 0.0);
++		for (size_t a = 0; a < n; a++) P[a + 1] = P[a] + (double)hist[n - 1 - a];
++		const auto integral = [&](double x) -> double {
++			if (x >= (double)n) return P[n];
++			const size_t a = (size_t)x;
++			return P[a] + (x - (double)a) * (double)hist[n - 1 - a];
++		};
++
++		//? Average every slot, oldest to newest. One extra slot is kept beyond the left edge so the leftmost column joins
++		//? up seamlessly, and slots older than the available history are left out so they are drawn blank.
++		deque<long long> view;
++		for (int q = slots; q >= 0; q--) {
++			const double x0 = axis.age_at(q);
++			if (x0 >= (double)n) continue;
++			const double x1 = std::min(axis.age_at(q + 1), (double)n);
++			view.push_back(std::llround((integral(x1) - integral(x0)) / (x1 - x0)));
++		}
++		this->_init(view);
++	}
++
+ 	string& Graph::operator()(const deque<long long>& data, const bool data_same) {
+ 		if (data_same) return out;
+ 
++		if (log_mode) {
++			if (not data.empty()) hist.push_back(data.back());
++			while (hist.size() > Config::hist_cap(width * 2 + 1)) hist.pop_front();
++			this->_rebuild();
++			return out;
++		}
++
+ 		//? Make room for new characters on graph
+ 		if (not tty_mode) current = not current;
+ 		for (const int& i : iota(0, height)) {
+@@ -467,6 +554,87 @@ namespace Draw {
+ 	string& Graph::operator()() {
+ 		return out;
+ 	}
++
++	//* Age in seconds as a short label: 10s, 90s, 5m, 1h, 1.5h
++	static string age_label(double s) {
++		if (s < 60 or (s < 180 and std::lround(s) % 60 != 0)) return std::to_string((int)std::lround(s)) + "s";
++		if (s < 3600) return std::to_string((int)std::lround(s / 60)) + "m";
++		const double h = s / 3600;
++		if (std::fabs(h - std::round(h)) < 0.05) return std::to_string((int)std::lround(h)) + "h";
++		char buf[16];
++		std::snprintf(buf, sizeof(buf), "%.1fh", h);
++		return buf;
++	}
++
++	string time_axis(const int x, const int y, const int width, const string& color, const string& graph_symbol) {
++		const string& symbol = (graph_symbol == "default" ? Config::getS("graph_symbol") : graph_symbol);
++		if (width < 10 or symbol == "tty" or Config::getB("tty_mode") or not Config::getB("graph_time_axis")) return "";
++
++		const TimeAxis axis(width * 2);
++		const double ms = std::max(100, Config::getI("update_ms"));
++		const double span = axis.span() * ms / 1000;   //? Age in seconds at the left edge
++
++		//? Graph column (0 = leftmost) of the boundary at an age in seconds
++		const auto col_of = [&](const double seconds) {
++			return clamp(width - (int)std::lround(axis.slot_at(seconds * 1000.0 / ms) / 2), 0, width - 1);
++		};
++
++		//? Major ticks at exact round times that roughly double from 1 minute (1m 2m 4m 8m 15m 30m 1h). On the compressing axis these
++		//? land at nearly even distances from each other, which is what lets the minor ticks below thicken up smoothly.
++		struct Major { int col; string text; };
++		vector<Major> majors = { {width - 1, "now"} };
++		for (const double s : {60.0, 120.0, 240.0, 480.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0, 28800.0, 57600.0}) {
++			if (s >= span * 0.93) break;
++			const int col = col_of(s);
++			if (col > majors.back().col - 2) continue;   //? Too close to the previous tick on a narrow graph
++			majors.push_back({col, age_label(s)});
++		}
++		while (majors.size() > 1 and majors.back().col < 3) majors.pop_back();   //? Make room for the oldest tick on the left edge
++		majors.push_back({0, age_label(span)});
++
++		//? Labels go to the right of their tick, "now" to the left of its tick. A label that does not fit is dropped, the tick stays.
++		vector<std::pair<int, int>> spans;   //? Columns covered by the labels that were kept
++		for (size_t j = 0; j < majors.size(); j++) {
++			auto& m = majors[j];
++			const int len = (int)m.text.size();
++			const int first = (j == 0 ? m.col - len : m.col + 1), last = (j == 0 ? m.col - 1 : m.col + len);
++			const bool clear_of_ticks = (j == 0 ? (majors.size() < 2 or first > majors[1].col + 1) : last + 1 < majors[j - 1].col);
++			if (first < 0 or not clear_of_ticks
++				or std::ranges::any_of(spans, [&](const auto& s) { return not (first > s.second + 1 or last < s.first - 1); })) {
++				m.text.clear();
++				continue;
++			}
++			spans.emplace_back(first, last);
++		}
++
++		//? Minor ticks: the interval between two major ticks is split into more parts the further left (older) it is, 1 part
++		//? between 1m and 2m, 2 between 2m and 4m, 3 between 4m and 8m and so on. The columns of an interval are dealt out in
++		//? whole numbers with the wider gaps first, and an interval gets extra parts if its first gap would be wider than the
++		//? last gap of the interval before it, so the distance between ticks only ever shrinks towards the oldest tick, down to
++		//? 2 columns. Ticks that would land on a label are left out.
++		string out;
++		int prev_last_gap = width;
++		for (size_t j = 1; j + 1 < majors.size(); j++) {
++			const int hi = majors[j].col, span_cols = hi - majors[j + 1].col;
++			int n = std::max(1, std::min((int)j, span_cols / 2));
++			while (n < span_cols / 2 and (span_cols + n - 1) / n > prev_last_gap) n++;
++			const int base = span_cols / n, rem = span_cols % n;
++			prev_last_gap = base;
++			for (int k = 0, col = hi; k < n - 1; k++) {
++				col -= base + (k < rem ? 1 : 0);
++				if (std::ranges::any_of(spans, [&](const auto& s) { return col >= s.first - 1 and col <= s.second + 1; })) continue;
++				out += Mv::to(y, x + col) + Fx::ub + color + "┴";
++			}
++		}
++
++		for (size_t j = 0; j < majors.size(); j++) {
++			const auto& m = majors[j];
++			const int len = (int)m.text.size();
++			if (j == 0 and len > 0) out += Mv::to(y, x + m.col - len) + Fx::ub + Theme::c("graph_text") + m.text + color + "┸";
++			else out += Mv::to(y, x + m.col) + Fx::ub + color + "┸" + Theme::c("graph_text") + m.text;
++		}
++		return out;
++	}
+ 	//*------------------------------------------------------------------------------------------------------------------------->
+ 
+ }
+@@ -538,6 +706,10 @@ namespace Cpu {
+ 			}
+ 			if (not single_graph)
+ 				graph_lower = Draw::Graph{x + width - b_width - 3, graph_low_height, "cpu", cpu.cpu_percent.at(graph_lo_field), graph_symbol, Config::getB("cpu_invert_lower"), true};
++
++			//? Time axis on the bottom border, unless the buttons live there (cpu_bottom)
++			if (not cpu_bottom)
++				out += Draw::time_axis(x + 1, y + height - 1, x + width - b_width - 3, Theme::c("cpu_box"), graph_symbol);
+ 			if (mid_line) {
+ 				auto upper_text = (graph_up_field == "total" and graph_lo_field == "gpu" ? "cpu"s : graph_up_field);
+ 				out += Mv::to(y + graph_up_height + 1, x) + Fx::ub + Theme::c("cpu_box") + Symbols::div_left + Theme::c("div_line")
+@@ -821,6 +993,9 @@ namespace Mem {
+ 							}
+ 						}
+ 					}
++					//? Time axis for the io graphs on the bottom border of the disks column
++					if (io_mode and not io_graphs.empty())
++						out += Draw::time_axis(x + 1 + mem_width, y + height - 1, disks_width, Theme::c("mem_box"), graph_symbol);
+ 				}
+ 
+ 				for (int i = 0; const auto& [name, ignored] : mem.disks) {
+@@ -869,8 +1044,8 @@ namespace Mem {
+ 					if (graph_height > 0) out += Mv::to(y + 1 + cy, x + 1 + cx) + divider;
+ 					cy += 1;
+ 				}
+-				out += Mv::to(y + 1 + cy, x + 1 + cx) + Theme::c("title") + Fx::b + "GPU" + (cpu_gpu ? " Shared" : "") + ":"
+-					+ rjust(floating_humanizer(mem.stats.at("gpu_total")), mem_width - 7 - (cpu_gpu ? 7 : 0)) + Theme::c("main_fg") + Fx::ub;
++				out += Mv::to(y + 1 + cy, x + 1 + cx) + Theme::c("title") + Fx::b + (cpu_gpu ? "GPU Shared" : "VRAM") + ":"
++					+ rjust(floating_humanizer(mem.stats.at("gpu_total")), mem_width - (cpu_gpu ? 14 : 8)) + Theme::c("main_fg") + Fx::ub;
+ 				cy += 1;
+ 				title = "Used";
+ 			}
+@@ -1027,6 +1202,7 @@ namespace Net {
+ 				return out + Fx::reset;
+ 			graphs["download"] = Draw::Graph{width - b_width - 2, u_graph_height, "download", net.bandwidth.at("download"), graph_symbol, false, true, down_max};
+ 			graphs["upload"] = Draw::Graph{width - b_width - 2, d_graph_height, "upload", net.bandwidth.at("upload"), graph_symbol, true, true, up_max};
++			out += Draw::time_axis(x + 1, y + height - 1, width - b_width - 2, Theme::c("net_box"), graph_symbol);
+ 
+ 			//? Interface selector and buttons
+ 
+diff --git a/src/btop_draw.hpp b/src/btop_draw.hpp
+index 154e691..bec45ff 100644
+--- a/src/btop_draw.hpp
++++ b/src/btop_draw.hpp
+@@ -102,11 +102,20 @@ namespace Draw {
+ 		long long offset;
+ 		long long last = 0, max_value = 0;
+ 		bool current = true, tty_mode = false;
++		//* Non-linear time axis: the graph keeps its own history in <hist> and is fully redrawn from it on every update
++		bool log_mode = false;
++		deque<long long> hist;
+ 		unordered_flat_map<bool, vector<string>> graphs = { {true, {}}, {false, {}}};
+ 
+ 		//* Create two representations of the graph to switch between to represent two values for each braille character
+ 		void _create(const deque<long long>& data, int data_offset);
+ 
++		//* (Re)populate the graph from a full series of values, one value per half column (per column in tty mode)
++		void _init(const deque<long long>& data);
++
++		//* Resample <hist> onto the non-linear time axis and redraw the whole graph
++		void _rebuild();
++
+ 	public:
+ 		Graph();
+ 		Graph(	int width,
+@@ -126,6 +135,10 @@ namespace Draw {
+ 		string& operator()();
+ 	};
+ 
++	//* Tick marks and time labels for the bottom border of a box, to sit under a graph <width> columns wide whose first column is at <x>.
++	//* <y> is the row of the border and <color> its color. Returns an empty string if the axis is disabled or does not fit.
++	string time_axis(int x, int y, int width, const string& color, const string& graph_symbol);
++
+ 	//* Calculate sizes of boxes, draw outlines and save to enabled boxes namespaces
+ 	void calcSizes();
+ }
